@@ -6,10 +6,10 @@ import json
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -19,25 +19,23 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import aiosqlite
 
-# --- НАСТРОЙКИ ДЛЯ RENDER.COM ---
-# На Render токен берётся из переменных окружения
+# --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("8657731994:AAFgwuJbbd2fqvtXUqapczb9Y1I1ajW-FDM")
 if not BOT_TOKEN:
-    raise ValueError("❌ Не найден BOT_TOKEN в переменных окружения Render")
+    raise ValueError("❌ Не найден BOT_TOKEN в переменных окружения")
 
-# ID админов берём из переменной окружения (через запятую)
 ADMIN_IDS_STR = os.getenv("5706071030", "")
 ADMIN_IDS = [int(id_str.strip()) for id_str in ADMIN_IDS_STR.split(",") if id_str.strip()]
 
 if not ADMIN_IDS:
-    print("⚠️ ВНИМАНИЕ: ADMIN_IDS не указаны. Админ-панель не будет работать.")
+    print("⚠️ ВНИМАНИЕ: ADMIN_IDS не указаны.")
 
-# Используем PostgreSQL для Render (автоматически определяется по DATABASE_URL)
-DATABASE_URL = os.getenv("DATABASE_URL")
-USE_POSTGRES = DATABASE_URL is not None
-
-# Для бекапов на Render используем временную папку
+# Используем только SQLite для простоты
+USE_POSTGRES = False
+DB_PATH = "hockey_cards.db"
 BACKUP_DIR = "/tmp/backups" if os.getenv("RENDER") else "backups"
+
+# Создаем папку для бекапов
 Path(BACKUP_DIR).mkdir(exist_ok=True)
 
 # Настройка логирования
@@ -69,60 +67,13 @@ class PromoCreation(StatesGroup):
     waiting_for_amount = State()
     waiting_for_uses = State()
 
-# --- АДАПТЕР БАЗЫ ДАННЫХ (SQLite / PostgreSQL) ---
-class DatabaseAdapter:
-    def __init__(self):
-        self.use_postgres = USE_POSTGRES
-        if self.use_postgres:
-            self.db_url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    
-    async def connect(self):
-        if self.use_postgres:
-            import asyncpg
-            return await asyncpg.connect(self.db_url)
-        else:
-            return await aiosqlite.connect("hockey_cards.db")
-    
-    async def execute(self, conn, query, *args):
-        if self.use_postgres:
-            # Конвертируем SQLite синтаксис в PostgreSQL
-            query = query.replace("AUTOINCREMENT", "")
-            query = query.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
-            return await conn.execute(query, *args)
-        else:
-            cursor = await conn.execute(query, args)
-            return cursor
-    
-    async def fetchone(self, cursor_or_result):
-        if self.use_postgres:
-            return await cursor_or_result.fetchone()
-        else:
-            return await cursor_or_result.fetchone()
-    
-    async def fetchall(self, cursor_or_result):
-        if self.use_postgres:
-            return await cursor_or_result.fetchall()
-        else:
-            return await cursor_or_result.fetchall()
-    
-    def placeholders(self, count):
-        if self.use_postgres:
-            return ", ".join([f"${i+1}" for i in range(count)])
-        else:
-            return ", ".join(["?" for _ in range(count)])
-
-db_adapter = DatabaseAdapter()
-
-# --- ИНИЦИАЛИЗАЦИЯ БД ---
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
 async def init_db():
-    if db_adapter.use_postgres:
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
-        
+    async with aiosqlite.connect(DB_PATH) as db:
         # Таблица карточек
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS cards (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 photo_id TEXT NOT NULL,
                 rarity TEXT NOT NULL,
@@ -131,120 +82,56 @@ async def init_db():
         """)
         
         # Таблица пользователей и их карточек
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS user_cards (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                card_id INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
-                obtained_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                card_id INTEGER NOT NULL,
+                obtained_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (card_id) REFERENCES cards (id) ON DELETE CASCADE
             )
         """)
         
         # Таблица промокодов
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS promocodes (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 code TEXT UNIQUE NOT NULL,
                 bonus_card_id INTEGER,
                 bonus_cards_amount INTEGER DEFAULT 1,
                 max_uses INTEGER DEFAULT 1,
                 uses INTEGER DEFAULT 0,
-                created_by BIGINT,
+                created_by INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 is_active INTEGER DEFAULT 1
             )
         """)
         
         # Таблица использования промокодов
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS promo_uses (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
                 promo_id INTEGER NOT NULL,
                 used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, promo_id)
             )
         """)
         
-        await conn.close()
-    else:
-        async with aiosqlite.connect("hockey_cards.db") as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS cards (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    photo_id TEXT NOT NULL,
-                    rarity TEXT NOT NULL,
-                    team TEXT NOT NULL
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS user_cards (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    card_id INTEGER NOT NULL,
-                    obtained_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (card_id) REFERENCES cards (id) ON DELETE CASCADE
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS promocodes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code TEXT UNIQUE NOT NULL,
-                    bonus_card_id INTEGER,
-                    bonus_cards_amount INTEGER DEFAULT 1,
-                    max_uses INTEGER DEFAULT 1,
-                    uses INTEGER DEFAULT 0,
-                    created_by INTEGER,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_active INTEGER DEFAULT 1
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS promo_uses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    promo_id INTEGER NOT NULL,
-                    used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, promo_id)
-                )
-            """)
-            await db.commit()
+        await db.commit()
     
-    logger.info(f"✅ База данных инициализирована ({'PostgreSQL' if db_adapter.use_postgres else 'SQLite'})")
+    logger.info("✅ База данных инициализирована")
 
-# --- ФУНКЦИИ ДЛЯ БЕКАПОВ (адаптированы под Render) ---
-async def create_backup() -> str:
+# --- ФУНКЦИИ ДЛЯ БЕКАПОВ ---
+async def create_backup() -> Optional[str]:
     """Создает резервную копию БД и возвращает путь к файлу."""
+    if not os.path.exists(DB_PATH):
+        return None
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = Path(BACKUP_DIR) / f"backup_{timestamp}.db"
     
-    if db_adapter.use_postgres:
-        # Для PostgreSQL делаем дамп
-        backup_path = Path(BACKUP_DIR) / f"backup_{timestamp}.sql"
-        # В реальном проекте здесь нужно использовать pg_dump
-        # Для упрощения просто создадим текстовый файл с данными
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
-        
-        # Собираем все данные
-        cards = await conn.fetch("SELECT * FROM cards")
-        promos = await conn.fetch("SELECT * FROM promocodes")
-        
-        backup_data = {
-            "timestamp": timestamp,
-            "cards": [dict(row) for row in cards],
-            "promocodes": [dict(row) for row in promos]
-        }
-        
-        with open(backup_path, 'w', encoding='utf-8') as f:
-            json.dump(backup_data, f, indent=2, default=str)
-        
-        await conn.close()
-    else:
-        backup_path = Path(BACKUP_DIR) / f"backup_{timestamp}.db"
-        if os.path.exists("hockey_cards.db"):
-            shutil.copy2("hockey_cards.db", backup_path)
-    
+    shutil.copy2(DB_PATH, backup_path)
     logger.info(f"💾 Создан бекап: {backup_path}")
     return str(backup_path)
 
@@ -257,8 +144,8 @@ async def send_backup_to_admins():
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_document(
-                admin_id, 
-                FSInputFile(backup_path), 
+                admin_id,
+                FSInputFile(backup_path),
                 caption=f"📅 Автоматический бекап от {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             )
         except Exception as e:
@@ -283,147 +170,78 @@ async def cmd_start(message: Message):
 async def cmd_get_card(message: Message):
     user_id = message.from_user.id
     
-    if db_adapter.use_postgres:
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
-        
+    async with aiosqlite.connect(DB_PATH) as db:
         # Проверка времени последнего получения
-        last_card = await conn.fetchrow(
-            "SELECT obtained_at FROM user_cards WHERE user_id = $1 ORDER BY obtained_at DESC LIMIT 1",
-            user_id
+        cursor = await db.execute(
+            "SELECT obtained_at FROM user_cards WHERE user_id = ? ORDER BY obtained_at DESC LIMIT 1",
+            (user_id,)
         )
+        last_card = await cursor.fetchone()
         
         if last_card:
-            last_time = last_card['obtained_at']
-            time_diff = datetime.now() - last_time
-            if time_diff < timedelta(hours=CARD_COOLDOWN_HOURS):
-                wait_time = timedelta(hours=CARD_COOLDOWN_HOURS) - time_diff
-                hours, remainder = divmod(wait_time.seconds, 3600)
-                minutes, _ = divmod(remainder, 60)
+            last_time = datetime.fromisoformat(last_card[0].replace('Z', '+00:00'))
+            time_diff = datetime.now(last_time.tzinfo) - last_time
+            # Конвертируем в часы
+            hours_passed = time_diff.total_seconds() / 3600
+            
+            if hours_passed < CARD_COOLDOWN_HOURS:
+                wait_hours = CARD_COOLDOWN_HOURS - hours_passed
+                hours = int(wait_hours)
+                minutes = int((wait_hours - hours) * 60)
                 await message.answer(f"⏳ Следующую карточку можно получить через {hours} ч. {minutes} мин.")
-                await conn.close()
                 return
         
         # Выдача случайной карточки
-        card = await conn.fetchrow("SELECT * FROM cards ORDER BY RANDOM() LIMIT 1")
+        cursor = await db.execute("SELECT id, name, photo_id, rarity, team FROM cards ORDER BY RANDOM() LIMIT 1")
+        card = await cursor.fetchone()
         
         if not card:
             await message.answer("😕 В базе пока нет карточек. Зайдите позже.")
-            await conn.close()
             return
         
-        # Добавляем карточку пользователю
-        await conn.execute(
-            "INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)",
-            user_id, card['id']
-        )
+        card_id, name, photo_id, rarity, team = card
         
-        await conn.close()
+        # Добавляем карточку пользователю
+        await db.execute(
+            "INSERT INTO user_cards (user_id, card_id) VALUES (?, ?)",
+            (user_id, card_id)
+        )
+        await db.commit()
         
         # Отправляем карточку
         await message.answer_photo(
-            card['photo_id'],
+            photo_id,
             caption=f"🎴 <b>Вы получили новую карточку!</b>\n\n"
-                    f"<b>{card['name']}</b>\n"
-                    f"Редкость: {card['rarity']}\n"
-                    f"Команда: {card['team']}",
+                    f"<b>{name}</b>\n"
+                    f"Редкость: {rarity}\n"
+                    f"Команда: {team}",
             parse_mode="HTML"
         )
-    else:
-        async with aiosqlite.connect("hockey_cards.db") as db:
-            # Проверка времени последнего получения
-            cursor = await db.execute(
-                "SELECT obtained_at FROM user_cards WHERE user_id = ? ORDER BY obtained_at DESC LIMIT 1", 
-                (user_id,)
-            )
-            last_card = await cursor.fetchone()
-            
-            if last_card:
-                last_time = datetime.fromisoformat(last_card[0])
-                time_diff = datetime.now() - last_time
-                if time_diff < timedelta(hours=CARD_COOLDOWN_HOURS):
-                    wait_time = timedelta(hours=CARD_COOLDOWN_HOURS) - time_diff
-                    hours, remainder = divmod(wait_time.seconds, 3600)
-                    minutes, _ = divmod(remainder, 60)
-                    await message.answer(f"⏳ Следующую карточку можно получить через {hours} ч. {minutes} мин.")
-                    return
-            
-            # Выдача случайной карточки
-            cursor = await db.execute("SELECT id, name, photo_id, rarity, team FROM cards ORDER BY RANDOM() LIMIT 1")
-            card = await cursor.fetchone()
-            
-            if not card:
-                await message.answer("😕 В базе пока нет карточек. Зайдите позже.")
-                return
-            
-            card_id, name, photo_id, rarity, team = card
-            
-            # Добавляем карточку пользователю
-            await db.execute(
-                "INSERT INTO user_cards (user_id, card_id) VALUES (?, ?)",
-                (user_id, card_id)
-            )
-            await db.commit()
-            
-            # Отправляем карточку
-            await message.answer_photo(
-                photo_id,
-                caption=f"🎴 <b>Вы получили новую карточку!</b>\n\n"
-                        f"<b>{name}</b>\n"
-                        f"Редкость: {rarity}\n"
-                        f"Команда: {team}",
-                parse_mode="HTML"
-            )
 
 @dp.message(Command("cards"))
 async def cmd_my_cards(message: Message):
     user_id = message.from_user.id
     
-    if db_adapter.use_postgres:
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
-        
-        cards = await conn.fetch("""
-            SELECT c.id, c.name, c.photo_id, c.rarity, c.team, COUNT(uc.id) as count
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT c.id, c.name, c.rarity, c.team, COUNT(uc.id) as count
             FROM user_cards uc
             JOIN cards c ON uc.card_id = c.id
-            WHERE uc.user_id = $1
-            GROUP BY c.id, c.name, c.photo_id, c.rarity, c.team
+            WHERE uc.user_id = ?
+            GROUP BY c.id
             ORDER BY count DESC
-        """, user_id)
-        
-        await conn.close()
+        """, (user_id,))
+        cards = await cursor.fetchall()
         
         if not cards:
             await message.answer("😴 У вас пока нет карточек. Получите первую: /get_card")
             return
         
         text = "🎴 <b>Ваша коллекция:</b>\n\n"
-        for i, card in enumerate(cards, 1):
-            text += f"{i}. {card['name']} ({card['rarity']}, {card['team']}) — {card['count']} шт.\n"
+        for i, (_, name, rarity, team, count) in enumerate(cards, 1):
+            text += f"{i}. {name} ({rarity}, {team}) — {count} шт.\n"
         
         await message.answer(text, parse_mode="HTML")
-    else:
-        async with aiosqlite.connect("hockey_cards.db") as db:
-            cursor = await db.execute("""
-                SELECT c.id, c.name, c.photo_id, c.rarity, c.team, COUNT(uc.id) as count
-                FROM user_cards uc
-                JOIN cards c ON uc.card_id = c.id
-                WHERE uc.user_id = ?
-                GROUP BY c.id
-                ORDER BY count DESC
-            """, (user_id,))
-            cards = await cursor.fetchall()
-            
-            if not cards:
-                await message.answer("😴 У вас пока нет карточек. Получите первую: /get_card")
-                return
-            
-            text = "🎴 <b>Ваша коллекция:</b>\n\n"
-            for i, (_, name, _, rarity, team, count) in enumerate(cards, 1):
-                text += f"{i}. {name} ({rarity}, {team}) — {count} шт.\n"
-            
-            await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("promo"))
 async def cmd_promo_input(message: Message):
@@ -437,120 +255,61 @@ async def handle_promo_input(message: Message):
     code = message.text.strip().upper()
     user_id = message.from_user.id
     
-    if db_adapter.use_postgres:
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
-        
+    async with aiosqlite.connect(DB_PATH) as db:
         # Проверяем промокод
-        promo = await conn.fetchrow(
-            "SELECT id, bonus_card_id, bonus_cards_amount, max_uses, uses, is_active FROM promocodes WHERE code = $1",
-            code
+        cursor = await db.execute(
+            "SELECT id, bonus_card_id, bonus_cards_amount, max_uses, uses, is_active FROM promocodes WHERE code = ?",
+            (code,)
         )
+        promo = await cursor.fetchone()
         
         if not promo:
             await message.answer("❌ Промокод не найден")
-            await conn.close()
             return
         
-        if not promo['is_active']:
+        promo_id, card_id, amount, max_uses, uses, is_active = promo
+        
+        if not is_active:
             await message.answer("❌ Промокод не активен")
-            await conn.close()
             return
         
-        if promo['uses'] >= promo['max_uses']:
+        if uses >= max_uses:
             await message.answer("❌ Достигнут лимит использования промокода")
-            await conn.close()
             return
         
         # Проверяем, использовал ли уже этот промокод пользователь
-        used = await conn.fetchrow(
-            "SELECT id FROM promo_uses WHERE user_id = $1 AND promo_id = $2",
-            user_id, promo['id']
+        cursor = await db.execute(
+            "SELECT id FROM promo_uses WHERE user_id = ? AND promo_id = ?",
+            (user_id, promo_id)
         )
-        if used:
+        if await cursor.fetchone():
             await message.answer("❌ Вы уже использовали этот промокод")
-            await conn.close()
             return
         
         # Выдаем карточки
-        for _ in range(promo['bonus_cards_amount']):
-            await conn.execute(
-                "INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)",
-                user_id, promo['bonus_card_id']
+        for _ in range(amount):
+            await db.execute(
+                "INSERT INTO user_cards (user_id, card_id) VALUES (?, ?)",
+                (user_id, card_id)
             )
         
         # Записываем использование
-        await conn.execute(
-            "INSERT INTO promo_uses (user_id, promo_id) VALUES ($1, $2)",
-            user_id, promo['id']
+        await db.execute(
+            "INSERT INTO promo_uses (user_id, promo_id) VALUES (?, ?)",
+            (user_id, promo_id)
         )
-        await conn.execute(
-            "UPDATE promocodes SET uses = uses + 1 WHERE id = $1",
-            promo['id']
+        await db.execute(
+            "UPDATE promocodes SET uses = uses + 1 WHERE id = ?",
+            (promo_id,)
         )
+        await db.commit()
         
         # Получаем название карточки
-        card = await conn.fetchrow("SELECT name FROM cards WHERE id = $1", promo['bonus_card_id'])
+        cursor = await db.execute("SELECT name FROM cards WHERE id = ?", (card_id,))
+        card = await cursor.fetchone()
+        card_name = card[0] if card else "Неизвестная карточка"
         
-        await conn.close()
-        
-        await message.answer(f"✅ Промокод активирован! Вы получили {promo['bonus_cards_amount']} карточек: {card['name']}")
-    else:
-        async with aiosqlite.connect("hockey_cards.db") as db:
-            # Проверяем промокод
-            cursor = await db.execute(
-                "SELECT id, bonus_card_id, bonus_cards_amount, max_uses, uses, is_active FROM promocodes WHERE code = ?",
-                (code,)
-            )
-            promo = await cursor.fetchone()
-            
-            if not promo:
-                await message.answer("❌ Промокод не найден")
-                return
-            
-            promo_id, card_id, amount, max_uses, uses, is_active = promo
-            
-            if not is_active:
-                await message.answer("❌ Промокод не активен")
-                return
-            
-            if uses >= max_uses:
-                await message.answer("❌ Достигнут лимит использования промокода")
-                return
-            
-            # Проверяем, использовал ли уже этот промокод пользователь
-            cursor = await db.execute(
-                "SELECT id FROM promo_uses WHERE user_id = ? AND promo_id = ?",
-                (user_id, promo_id)
-            )
-            if await cursor.fetchone():
-                await message.answer("❌ Вы уже использовали этот промокод")
-                return
-            
-            # Выдаем карточки
-            for _ in range(amount):
-                await db.execute(
-                    "INSERT INTO user_cards (user_id, card_id) VALUES (?, ?)",
-                    (user_id, card_id)
-                )
-            
-            # Записываем использование
-            await db.execute(
-                "INSERT INTO promo_uses (user_id, promo_id) VALUES (?, ?)",
-                (user_id, promo_id)
-            )
-            await db.execute(
-                "UPDATE promocodes SET uses = uses + 1 WHERE id = ?",
-                (promo_id,)
-            )
-            await db.commit()
-            
-            # Получаем название карточки
-            cursor = await db.execute("SELECT name FROM cards WHERE id = ?", (card_id,))
-            card = await cursor.fetchone()
-            card_name = card[0] if card else "Неизвестная карточка"
-            
-            await message.answer(f"✅ Промокод активирован! Вы получили {amount} карточек: {card_name}")
+        await message.answer(f"✅ Промокод активирован! Вы получили {amount} карточек: {card_name}")
 
 # --- АДМИН ПАНЕЛЬ ---
 @dp.message(Command("admin"))
@@ -573,12 +332,12 @@ async def admin_create_backup(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return await callback.answer("Нет доступа", show_alert=True)
     
-    await callback.answer()
+    await callback.answer("Создаю бекап...")
     backup_path = await create_backup()
     
     if backup_path:
         await bot.send_document(
-            callback.from_user.id, 
+            callback.from_user.id,
             FSInputFile(backup_path),
             caption=f"📦 Ручной бекап от {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
@@ -593,29 +352,18 @@ async def admin_stats(callback: CallbackQuery):
     
     await callback.answer()
     
-    if db_adapter.use_postgres:
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM cards")
+        total_cards = (await cursor.fetchone())[0]
         
-        total_cards = await conn.fetchval("SELECT COUNT(*) FROM cards")
-        total_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM user_cards")
-        total_collected = await conn.fetchval("SELECT COUNT(*) FROM user_cards")
-        total_promos = await conn.fetchval("SELECT COUNT(*) FROM promocodes")
+        cursor = await db.execute("SELECT COUNT(DISTINCT user_id) FROM user_cards")
+        total_users = (await cursor.fetchone())[0]
         
-        await conn.close()
-    else:
-        async with aiosqlite.connect("hockey_cards.db") as db:
-            cursor = await db.execute("SELECT COUNT(*) FROM cards")
-            total_cards = (await cursor.fetchone())[0]
-            
-            cursor = await db.execute("SELECT COUNT(DISTINCT user_id) FROM user_cards")
-            total_users = (await cursor.fetchone())[0]
-            
-            cursor = await db.execute("SELECT COUNT(*) FROM user_cards")
-            total_collected = (await cursor.fetchone())[0]
-            
-            cursor = await db.execute("SELECT COUNT(*) FROM promocodes")
-            total_promos = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM user_cards")
+        total_collected = (await cursor.fetchone())[0]
+        
+        cursor = await db.execute("SELECT COUNT(*) FROM promocodes")
+        total_promos = (await cursor.fetchone())[0]
     
     text = (f"📊 <b>Статистика бота:</b>\n"
             f"👥 Пользователей: {total_users}\n"
@@ -666,21 +414,12 @@ async def card_rarity_chosen(callback: CallbackQuery, state: FSMContext):
 async def card_team_entered(message: Message, state: FSMContext):
     data = await state.get_data()
     
-    if db_adapter.use_postgres:
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
-        await conn.execute(
-            "INSERT INTO cards (name, photo_id, rarity, team) VALUES ($1, $2, $3, $4)",
-            data['name'], data['photo_id'], data['rarity'], message.text
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO cards (name, photo_id, rarity, team) VALUES (?, ?, ?, ?)",
+            (data['name'], data['photo_id'], data['rarity'], message.text)
         )
-        await conn.close()
-    else:
-        async with aiosqlite.connect("hockey_cards.db") as db:
-            await db.execute(
-                "INSERT INTO cards (name, photo_id, rarity, team) VALUES (?, ?, ?, ?)",
-                (data['name'], data['photo_id'], data['rarity'], message.text)
-            )
-            await db.commit()
+        await db.commit()
     
     await message.answer(f"✅ Карточка '{data['name']}' успешно добавлена!")
     await state.clear()
@@ -714,11 +453,9 @@ async def promo_code_entered(message: Message, state: FSMContext):
     code = message.text.upper()
     await state.update_data(code=code)
     
-    if db_adapter.use_postgres:
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
-        cards = await conn.fetch("SELECT id, name FROM cards ORDER BY id")
-        await conn.close()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id, name FROM cards ORDER BY id")
+        cards = await cursor.fetchall()
         
         if not cards:
             await message.answer("В базе нет карточек. Сначала создайте карточку.")
@@ -726,25 +463,10 @@ async def promo_code_entered(message: Message, state: FSMContext):
             return
         
         text = "Выберите ID карточки для бонуса:\n\n"
-        for card in cards:
-            text += f"{card['id']}. {card['name']}\n"
+        for card_id, name in cards:
+            text += f"{card_id}. {name}\n"
         
-        await state.update_data(cards_dict={str(card['id']): card['name'] for card in cards})
-    else:
-        async with aiosqlite.connect("hockey_cards.db") as db:
-            cursor = await db.execute("SELECT id, name FROM cards ORDER BY id")
-            cards = await cursor.fetchall()
-            
-            if not cards:
-                await message.answer("В базе нет карточек. Сначала создайте карточку.")
-                await state.clear()
-                return
-            
-            text = "Выберите ID карточки для бонуса:\n\n"
-            for card_id, name in cards:
-                text += f"{card_id}. {name}\n"
-            
-            await state.update_data(cards_dict={str(card[0]): card[1] for card in cards})
+        await state.update_data(cards_dict={str(card[0]): card[1] for card in cards})
     
     await message.answer(text)
     await state.set_state(PromoCreation.waiting_for_card_selection)
@@ -792,29 +514,16 @@ async def promo_uses_entered(message: Message, state: FSMContext):
     
     data = await state.get_data()
     
-    if db_adapter.use_postgres:
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
+    async with aiosqlite.connect(DB_PATH) as db:
         try:
-            await conn.execute(
-                "INSERT INTO promocodes (code, bonus_card_id, bonus_cards_amount, max_uses, created_by) VALUES ($1, $2, $3, $4, $5)",
-                data['code'], data['card_id'], data['amount'], max_uses, message.from_user.id
+            await db.execute(
+                "INSERT INTO promocodes (code, bonus_card_id, bonus_cards_amount, max_uses, created_by) VALUES (?, ?, ?, ?, ?)",
+                (data['code'], data['card_id'], data['amount'], max_uses, message.from_user.id)
             )
+            await db.commit()
             await message.answer(f"✅ Промокод {data['code']} успешно создан!")
-        except asyncpg.exceptions.UniqueViolationError:
+        except sqlite3.IntegrityError:
             await message.answer("❌ Промокод с таким названием уже существует")
-        await conn.close()
-    else:
-        async with aiosqlite.connect("hockey_cards.db") as db:
-            try:
-                await db.execute(
-                    "INSERT INTO promocodes (code, bonus_card_id, bonus_cards_amount, max_uses, created_by) VALUES (?, ?, ?, ?, ?)",
-                    (data['code'], data['card_id'], data['amount'], max_uses, message.from_user.id)
-                )
-                await db.commit()
-                await message.answer(f"✅ Промокод {data['code']} успешно создан!")
-            except sqlite3.IntegrityError:
-                await message.answer("❌ Промокод с таким названием уже существует")
     
     await state.clear()
 
@@ -825,49 +534,26 @@ async def promo_list(callback: CallbackQuery):
     
     await callback.answer()
     
-    if db_adapter.use_postgres:
-        import asyncpg
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1))
-        promos = await conn.fetch("""
-            SELECT p.*, c.name as card_name 
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT p.code, c.name, p.uses, p.max_uses, p.is_active
             FROM promocodes p 
             LEFT JOIN cards c ON p.bonus_card_id = c.id 
             ORDER BY p.created_at DESC 
             LIMIT 10
         """)
-        await conn.close()
+        promos = await cursor.fetchall()
         
         if not promos:
             await callback.message.answer("Нет созданных промокодов")
             return
         
         text = "🎫 <b>Последние промокоды:</b>\n\n"
-        for promo in promos:
-            status = "✅" if promo['is_active'] else "❌"
-            text += (f"{status} <code>{promo['code']}</code>\n"
-                    f"Карточка: {promo['card_name']}\n"
-                    f"Использовано: {promo['uses']}/{promo['max_uses']}\n\n")
-    else:
-        async with aiosqlite.connect("hockey_cards.db") as db:
-            cursor = await db.execute("""
-                SELECT p.*, c.name as card_name 
-                FROM promocodes p 
-                LEFT JOIN cards c ON p.bonus_card_id = c.id 
-                ORDER BY p.created_at DESC 
-                LIMIT 10
-            """)
-            promos = await cursor.fetchall()
-            
-            if not promos:
-                await callback.message.answer("Нет созданных промокодов")
-                return
-            
-            text = "🎫 <b>Последние промокоды:</b>\n\n"
-            for promo in promos:
-                status = "✅" if promo[9] else "❌"  # is_active
-                text += (f"{status} <code>{promo[1]}</code>\n"  # code
-                        f"Карточка: {promo[10]}\n"  # card_name
-                        f"Использовано: {promo[6]}/{promo[5]}\n\n")  # uses/max_uses
+        for code, card_name, uses, max_uses, is_active in promos:
+            status = "✅" if is_active else "❌"
+            text += (f"{status} <code>{code}</code>\n"
+                    f"Карточка: {card_name}\n"
+                    f"Использовано: {uses}/{max_uses}\n\n")
     
     await callback.message.answer(text, parse_mode="HTML")
 
@@ -900,6 +586,10 @@ async def main():
     scheduler.start()
     
     logger.info("🤖 Бот запущен!")
+    
+    # Удаляем вебхук на всякий случай
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
